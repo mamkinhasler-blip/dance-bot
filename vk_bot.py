@@ -41,10 +41,6 @@ GROUP_ID = int(os.environ["VK_GROUP_ID"])
 # Несколько админов сразу: и педагог, и разработчик могут управлять ботом
 # каждый под своим VK-аккаунтом. Формат: "111,222,333" или просто "111".
 ADMIN_IDS = {int(x.strip()) for x in os.environ["VK_ADMIN_ID"].split(",") if x.strip()}
-# ADMIN_ID оставлен как алиас первого админа — используется там, где раньше
-# было единственное значение (например, некому конкретно писать, если админов
-# несколько — тогда шлём всем через notify_all_admins).
-ADMIN_ID = next(iter(ADMIN_IDS))
 
 API_URL = "https://api.vk.com/method/"
 API_VERSION = "5.131"
@@ -78,21 +74,67 @@ def api(method: str, **params):
     return None
 
 
+VK_LABEL_LIMIT = 40   # максимальная длина подписи кнопки
+VK_MESSAGE_LIMIT = 4000  # у messages.send лимит ~4096, берём с запасом
+
+
+def _cut(label: str, limit: int = VK_LABEL_LIMIT) -> str:
+    """Обрезать подпись кнопки под лимит VK.
+
+    Без этого длинное ФИО («Верещагина-Оболенская Анна-Мария
+    Константиновна») вместе с чекбоксом и балансом выходит за 40 символов,
+    и VK отказывается рисовать ВСЮ клавиатуру целиком — педагог остаётся
+    без кнопок вообще.
+    """
+    label = str(label)
+    return label if len(label) <= limit else label[:limit - 1].rstrip() + "…"
+
+
 def send(peer_id: int, text: str, keyboard=None):
-    params = {
-        "peer_id": peer_id,
-        "message": text,
-        "random_id": random.randint(1, 2**31),
-    }
-    if keyboard is not None:
-        params["keyboard"] = json.dumps(keyboard, ensure_ascii=False)
-    return api("messages.send", **params)
+    """Отправить сообщение. Длинный текст (большой список или отчёт) режется
+    на части: VK молча не доставит сообщение длиннее ~4096 символов.
+    Клавиатура прикрепляется к последней части."""
+    parts = _split_message(text)
+    result = None
+    for i, part in enumerate(parts):
+        params = {
+            "peer_id": peer_id,
+            "message": part,
+            "random_id": random.randint(1, 2**31),
+        }
+        if keyboard is not None and i == len(parts) - 1:
+            params["keyboard"] = json.dumps(keyboard, ensure_ascii=False)
+        result = api("messages.send", **params)
+    return result
+
+
+def _split_message(text: str, limit: int = VK_MESSAGE_LIMIT) -> list[str]:
+    """Разбить длинный текст по строкам, не разрывая строки посередине."""
+    if len(text) <= limit:
+        return [text]
+    parts, current = [], ""
+    for line in text.split("\n"):
+        # одна строка сама по себе длиннее лимита — режем жёстко
+        while len(line) > limit:
+            if current:
+                parts.append(current)
+                current = ""
+            parts.append(line[:limit])
+            line = line[limit:]
+        if len(current) + len(line) + 1 > limit:
+            parts.append(current)
+            current = line
+        else:
+            current = f"{current}\n{line}" if current else line
+    if current:
+        parts.append(current)
+    return parts
 
 
 def send_with_attachment(peer_id: int, text: str, attachment: str, keyboard=None):
     params = {
         "peer_id": peer_id,
-        "message": text,
+        "message": _split_message(text)[0],
         "random_id": random.randint(1, 2**31),
         "attachment": attachment,
     }
@@ -137,6 +179,18 @@ BTN_CARD = "ℹ️ Карточка ученика"
 BTN_UPLOAD_SCHEDULE = "📤 Обновить расписание"
 BTN_CHILD = "👶 Ребёнок"
 BTN_ADULT = "🧑 Взрослый"
+BTN_GROUPS = "👥 Группы"
+BTN_NEW_GROUP = "➕ Новая группа"
+BTN_RENAME_GROUP = "✏️ Переименовать"
+BTN_DELETE_GROUP = "🗑 Удалить группу"
+BTN_CONFIRM_DELETE_GROUP = "🗑 Да, удалить группу"
+BTN_GROUP_STUDENTS = "👥 Состав группы"
+BTN_ASSIGN_GROUPS = "👥 Назначить группы"
+BTN_ALL_STUDENTS = "👥 Все ученики"
+BTN_NO_GROUP = "🚫 Без группы"
+BTN_SELECT_ALL = "☑️ Отметить всех"
+BTN_CLEAR_ALL = "☐ Снять всех"
+BTN_REPORT = "📊 Отчёт"
 
 # Цены — по запросу педагога. Если поменяются, править только тут.
 PRICE_TEXT = (
@@ -158,7 +212,20 @@ PRICE_TEXT = (
 )
 
 # Команды главного меню педагога — доступны только админу.
-ADMIN_MENU_CMDS = {"new", "lesson", "list", "pay", "link", "delete", "deposit", "card", "upload_schedule"}
+ADMIN_MENU_CMDS = {"new", "lesson", "list", "pay", "link", "delete", "deposit", "card",
+                    "upload_schedule", "groups", "assign_groups", "report"}
+
+# Дополнительные служебные команды (кнопки внутри многошаговых сценариев) —
+# тоже только для админа, но не входят в главное меню.
+ADMIN_ONLY_EXTRA_CMDS = {
+    "pick", "pick_page", "pick_cancel", "att", "att_page", "att_done", "att_cancel",
+    "att_all", "att_none", "del_ok",
+    "lesson_pick_group", "lesson_all", "lesson_group", "lesson_nogroup", "lesson_group_page",
+    "grp_new", "grp_open", "grp_rename", "grp_delete", "grp_delete_ok", "grp_page",
+    "grp_students", "grp_stud_toggle", "grp_stud_page", "grp_stud_done", "grp_stud_cancel",
+    "sgrp_start", "sgrp_toggle", "sgrp_page", "sgrp_done", "sgrp_cancel",
+    "report_run", "noop",
+}
 
 
 def _btn(label: str, cmd: str, extra: dict | None = None, color: str = "secondary"):
@@ -166,7 +233,7 @@ def _btn(label: str, cmd: str, extra: dict | None = None, color: str = "secondar
     if extra:
         payload.update(extra)
     return {
-        "action": {"type": "text", "label": label, "payload": json.dumps(payload)},
+        "action": {"type": "text", "label": _cut(label), "payload": json.dumps(payload)},
         "color": color,
     }
 
@@ -180,6 +247,8 @@ ADMIN_MENU = {
         [_btn(BTN_LINK, "link"), _btn(BTN_DELETE, "delete", color="negative")],
         [_btn(BTN_CARD, "card"), _btn(BTN_DEPOSIT, "deposit")],
         [_btn(BTN_SCHEDULE, "schedule"), _btn(BTN_UPLOAD_SCHEDULE, "upload_schedule")],
+        [_btn(BTN_GROUPS, "groups"), _btn(BTN_ASSIGN_GROUPS, "assign_groups")],
+        [_btn(BTN_REPORT, "report")],
     ],
 }
 
@@ -208,54 +277,227 @@ CATEGORY_MENU = {
 }
 
 
-def paged(students: list, page: int) -> tuple[list, int, int]:
-    total = max(1, (len(students) + PAGE_SIZE - 1) // PAGE_SIZE)
+def paged(items: list, page: int) -> tuple[list, int, int]:
+    total = max(1, (len(items) + PAGE_SIZE - 1) // PAGE_SIZE)
     page = max(0, min(page, total - 1))
-    return students[page * PAGE_SIZE:(page + 1) * PAGE_SIZE], page, total
+    return items[page * PAGE_SIZE:(page + 1) * PAGE_SIZE], page, total
+
+
+def build_list_keyboard(items: list, page: int, row_btn, nav_cmd: str,
+                        nav_extra: dict | None = None,
+                        footer: list | None = None,
+                        empty_text: str | None = None) -> dict:
+    """
+    Общий конструктор клавиатуры-списка с постраничной навигацией.
+    Раньше эта логика была скопирована в четырёх местах, из-за чего экраны
+    групп ушли без пагинации и ломались бы о лимит VK (10 рядов на клавиатуру).
+
+    items    — что показываем (ученики, группы...)
+    row_btn  — функция (item, page) -> кнопка
+    nav_cmd  — cmd для кнопок «Назад»/«Ещё»
+    nav_extra— что ещё положить в payload навигации (например, id группы)
+    footer   — фиксированные ряды внизу (Готово/Отмена)
+    """
+    chunk, page, total = paged(items, page)
+    rows = [[row_btn(it, page)] for it in chunk]
+    extra = dict(nav_extra or {})
+    nav = []
+    if page > 0:
+        nav.append(_btn(BTN_BACK, nav_cmd, {**extra, "page": page - 1}))
+    if page < total - 1:
+        nav.append(_btn(BTN_MORE, nav_cmd, {**extra, "page": page + 1}))
+    if nav:
+        rows.append(nav)
+    if not chunk and empty_text:
+        rows.append([_btn(empty_text, "noop", color="secondary")])
+    rows.extend(footer or [])
+    return {"one_time": False, "inline": False, "buttons": rows}
 
 
 def pick_keyboard(action: str, page: int) -> dict:
-    """Список учеников для выбора: оплата / ссылка / удаление."""
-    students = core.list_students()
-    chunk, page, total = paged(students, page)
-    rows = [
-        [_btn(f"{s['name']} ({s['balance']})", "pick", {"act": action, "id": s["id"]})]
-        for s in chunk
-    ]
-    nav = []
-    if page > 0:
-        nav.append(_btn(BTN_BACK, "pick_page", {"act": action, "page": page - 1}))
-    if page < total - 1:
-        nav.append(_btn(BTN_MORE, "pick_page", {"act": action, "page": page + 1}))
-    if nav:
-        rows.append(nav)
-    rows.append([_btn(BTN_CANCEL, "pick_cancel", color="negative")])
-    return {"one_time": False, "inline": False, "buttons": rows}
+    """Список учеников для выбора: оплата / ссылка / удаление / группы."""
+    return build_list_keyboard(
+        core.list_students(), page,
+        row_btn=lambda s, p: _btn(f"{s['name']} ({s['balance']})", "pick",
+                                  {"act": action, "id": s["id"]}),
+        nav_cmd="pick_page", nav_extra={"act": action},
+        footer=[[_btn(BTN_CANCEL, "pick_cancel", color="negative")]],
+        empty_text="(список пуст)",
+    )
 
 
-def attendance_keyboard(selected: set[int], page: int) -> dict:
-    students = core.list_students()
-    chunk, page, total = paged(students, page)
-    rows = []
-    for s in chunk:
+def attendance_students(filter_type: str, group_id: int | None = None) -> list:
+    """Список учеников для отметки занятия — либо все, либо только по группе,
+    либо только те, кто ни в одной группе не состоит."""
+    if filter_type == "group":
+        return core.list_students_by_group(group_id)
+    if filter_type == "none":
+        return core.list_students_without_group()
+    return core.list_students()
+
+
+def attendance_title(filter_type: str, group_id: int | None = None) -> str:
+    """Человеческое название текущего списка отметки."""
+    if filter_type == "group":
+        g = core.get_group(group_id)
+        return g["name"] if g else "группа удалена"
+    if filter_type == "none":
+        return "без группы"
+    return "все ученики"
+
+
+def attendance_prompt(selected: set[int], filter_type: str = "all",
+                       group_id: int | None = None) -> str:
+    """
+    Подпись над клавиатурой отметки. Показывает, ПО КАКОЙ группе идёт отметка
+    и сколько уже отмечено — раньше педагог видел только безликое «отметьте,
+    кто был», а при листании страниц было легко потерять счёт.
+    """
+    students = attendance_students(filter_type, group_id)
+    ids = {s["id"] for s in students}
+    done = len(selected & ids)
+    return (
+        f"✅ Занятие — {attendance_title(filter_type, group_id)}\n"
+        f"Отмечено: {done} из {len(students)}\n\n"
+        f"Отметьте, кто был, затем нажмите «{BTN_DONE}»."
+    )
+
+
+def attendance_keyboard(selected: set[int], page: int, filter_type: str = "all",
+                         group_id: int | None = None) -> dict:
+    students = attendance_students(filter_type, group_id)
+    extra = {"filter_type": filter_type}
+    if group_id is not None:
+        extra["group_id"] = group_id
+
+    def row(s, p):
         box = "☑️" if s["id"] in selected else "☐"
-        rows.append([_btn(
-            f"{box} {s['name']} ({s['balance']})",
-            "att", {"id": s["id"], "page": page},
-            color="positive" if s["id"] in selected else "secondary",
-        )])
-    nav = []
-    if page > 0:
-        nav.append(_btn(BTN_BACK, "att_page", {"page": page - 1}))
-    if page < total - 1:
-        nav.append(_btn(BTN_MORE, "att_page", {"page": page + 1}))
-    if nav:
-        rows.append(nav)
-    rows.append([
-        _btn(BTN_DONE, "att_done", color="primary"),
-        _btn(BTN_CANCEL, "att_cancel", color="negative"),
-    ])
-    return {"one_time": False, "inline": False, "buttons": rows}
+        return _btn(f"{box} {s['name']} ({s['balance']})", "att",
+                    {**extra, "id": s["id"], "page": p},
+                    color="positive" if s["id"] in selected else "secondary")
+
+    # «Отметить всех» — в группе из 12 человек обычно проще снять двоих
+    # отсутствующих, чем натыкать десять присутствующих.
+    all_ids = {s["id"] for s in students}
+    if all_ids and all_ids <= selected:
+        bulk = _btn(BTN_CLEAR_ALL, "att_none", extra)
+    else:
+        bulk = _btn(BTN_SELECT_ALL, "att_all", extra, color="primary")
+
+    return build_list_keyboard(
+        students, page, row_btn=row, nav_cmd="att_page", nav_extra=extra,
+        footer=[
+            [bulk],
+            [_btn(BTN_DONE, "att_done", color="primary"),
+             _btn(BTN_CANCEL, "att_cancel", color="negative")],
+        ],
+        empty_text="(в этом списке пока никого нет)",
+    )
+
+
+def lesson_group_choice_keyboard(page: int = 0) -> dict:
+    """Перед отметкой занятия — выбор, по какой группе отмечаем."""
+    # «Все» и «Без группы» кладём в один ряд: у VK лимит 10 рядов на
+    # клавиатуру, и при полной странице групп запас лишним не бывает.
+    extras = [_btn(BTN_ALL_STUDENTS, "lesson_all")]
+    if core.list_students_without_group():
+        extras.append(_btn(BTN_NO_GROUP, "lesson_nogroup"))
+    return build_list_keyboard(
+        core.list_groups(), page,
+        row_btn=lambda g, p: _btn(f"👥 {g['name']}", "lesson_group", {"id": g["id"]}),
+        nav_cmd="lesson_group_page",
+        footer=[extras, [_btn(BTN_CANCEL, "pick_cancel", color="negative")]],
+    )
+
+
+# ------------------------- клавиатуры для управления группами -------------------------
+
+def groups_menu_keyboard(page: int = 0) -> dict:
+    return build_list_keyboard(
+        core.list_groups(), page,
+        row_btn=lambda g, p: _btn(f"👥 {g['name']}", "grp_open", {"id": g["id"]}),
+        nav_cmd="grp_page",
+        footer=[
+            [_btn(BTN_NEW_GROUP, "grp_new", color="primary")],
+            [_btn(BTN_CANCEL, "pick_cancel", color="negative")],
+        ],
+        empty_text="(групп пока нет)",
+    )
+
+
+def group_detail_keyboard(gid: int) -> dict:
+    return {
+        "one_time": False,
+        "inline": False,
+        "buttons": [
+            [_btn(BTN_GROUP_STUDENTS, "grp_students", {"id": gid}, color="primary")],
+            [_btn(BTN_RENAME_GROUP, "grp_rename", {"id": gid})],
+            [_btn(BTN_DELETE_GROUP, "grp_delete", {"id": gid}, color="negative")],
+            [_btn(BTN_BACK, "groups")],
+        ],
+    }
+
+
+def group_confirm_delete_keyboard(gid: int) -> dict:
+    return {
+        "one_time": False,
+        "inline": False,
+        "buttons": [[
+            _btn(BTN_CONFIRM_DELETE_GROUP, "grp_delete_ok", {"id": gid}, color="negative"),
+            _btn(BTN_CANCEL, "pick_cancel", color="secondary"),
+        ]],
+    }
+
+
+def group_students_keyboard(gid: int, page: int) -> dict:
+    """Состав группы: чек-лист всех активных учеников, галочка = в группе.
+    Нажатие сразу пишет в базу — отдельного «сохранить» не нужно."""
+    member_ids = {s["id"] for s in core.list_students_by_group(gid)}
+
+    def row(s, p):
+        box = "☑️" if s["id"] in member_ids else "☐"
+        return _btn(f"{box} {s['name']}", "grp_stud_toggle",
+                    {"gid": gid, "id": s["id"], "page": p},
+                    color="positive" if s["id"] in member_ids else "secondary")
+
+    return build_list_keyboard(
+        core.list_students(), page, row_btn=row,
+        nav_cmd="grp_stud_page", nav_extra={"gid": gid},
+        footer=[[_btn(BTN_DONE, "grp_stud_done", {"id": gid}, color="primary")]],
+        empty_text="(учеников пока нет)",
+    )
+
+
+def student_groups_keyboard(sid: int, selected: set[int], page: int) -> dict:
+    """Обратная сторона того же самого: список групп для одного ученика."""
+    def row(g, p):
+        box = "☑️" if g["id"] in selected else "☐"
+        return _btn(f"{box} {g['name']}", "sgrp_toggle",
+                    {"sid": sid, "id": g["id"], "page": p},
+                    color="positive" if g["id"] in selected else "secondary")
+
+    return build_list_keyboard(
+        core.list_groups(), page, row_btn=row,
+        nav_cmd="sgrp_page", nav_extra={"sid": sid},
+        footer=[[
+            _btn(BTN_DONE, "sgrp_done", {"sid": sid}, color="primary"),
+            _btn(BTN_CANCEL, "sgrp_cancel", color="negative"),
+        ]],
+        empty_text="Групп пока нет — создайте в «Группы»",
+    )
+
+
+def report_period_keyboard() -> dict:
+    return {
+        "one_time": False,
+        "inline": False,
+        "buttons": [
+            [_btn("📊 За неделю", "report_run", {"days": 7}, color="primary"),
+             _btn("📊 За месяц", "report_run", {"days": 30}, color="primary")],
+            [_btn("📊 За 3 месяца", "report_run", {"days": 90})],
+            [_btn(BTN_CANCEL, "pick_cancel", color="negative")],
+        ],
+    }
 
 
 def confirm_delete_keyboard(sid: int) -> dict:
@@ -270,11 +512,61 @@ def confirm_delete_keyboard(sid: int) -> dict:
 
 
 # ------------------------- состояние диалогов -------------------------
-# Простой словарь в памяти: педагог один, сложный FSM тут излишен.
+# Состояние дублируется в базу (таблица sessions): раньше оно жило только в
+# памяти процесса, и перезапуск бота посреди анкеты или отметки занятия
+# терял всё молча. Теперь при старте состояние поднимается обратно.
+
+class _Store(dict):
+    """Словарь {user_id: значение}, зеркалящий записи в базу.
+
+    encode/decode нужны для множеств (set не сериализуется в JSON напрямую).
+    Мутации значения на месте (selected.add(...)) базой не отслеживаются —
+    после них нужно явно вызвать .save(user_id).
+    """
+
+    def __init__(self, kind: str, encode=lambda v: v, decode=lambda v: v):
+        super().__init__()
+        self.kind = kind
+        self._encode = encode
+        self._decode = decode
+
+    def load(self):
+        for uid, payload in core.load_sessions("vk", self.kind).items():
+            try:
+                super().__setitem__(uid, self._decode(payload))
+            except Exception:
+                continue
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        self.save(key)
+
+    def save(self, key):
+        if key in self:
+            try:
+                core.save_session(key, "vk", self.kind, self._encode(self[key]))
+            except Exception:
+                log.exception("Не удалось сохранить сессию %s/%s", key, self.kind)
+
+    def pop(self, key, default=None):
+        try:
+            core.delete_session(key, "vk", self.kind)
+        except Exception:
+            log.exception("Не удалось удалить сессию %s/%s", key, self.kind)
+        return super().pop(key, default)
+
+    def setdefault(self, key, default=None):
+        if key not in self:
+            self[key] = default
+        return self[key]
+
+
 # {user_id: {"step": "...", "data": {...}}}
-_state: dict[int, dict] = {}
+_state: _Store = _Store("state")
 # выбранные на текущем занятии ученики: {user_id: set(student_id)}
-_attendance: dict[int, set[int]] = {}
+_attendance: _Store = _Store("attendance", encode=sorted, decode=set)
+# выбранные группы в мультивыборе (назначение групп одному ученику)
+_multi: _Store = _Store("multi", encode=sorted, decode=set)
 
 
 def is_admin(user_id: int) -> bool:
@@ -309,6 +601,9 @@ def student_card_text(s: sqlite3.Row) -> str:
         lines.append(f"Телефон: {s['phone']}")
     if s["contact_channel"]:
         lines.append(f"Канал связи: {s['contact_channel']}")
+
+    groups = core.get_student_groups(s["id"])
+    lines.append(f"Группы: {', '.join(g['name'] for g in groups) if groups else 'не назначены'}")
 
     lines.append("")
     lines.append(f"💳 Баланс: {s['balance']} занятий")
@@ -345,15 +640,70 @@ def notify_admin_registration(student: sqlite3.Row):
         f"Канал связи: {student['contact_channel']}"
     )
     text = f"🆕 Новая анкета\n\n{details}\n\n💰 Баланс пока 0 занятий. Назначить количество занятий?"
-    kb = {
-        "one_time": False,
-        "inline": False,
-        "buttons": [[
-            _btn("💰 Задать занятия", "pick", {"act": "pay", "id": student["id"]}, color="primary"),
-        ]],
-    }
+    buttons = [[
+        _btn("💰 Задать занятия", "pick", {"act": "pay", "id": student["id"]}, color="primary"),
+    ]]
+    if core.list_groups():
+        buttons.append([_btn(BTN_ASSIGN_GROUPS, "sgrp_start", {"id": student["id"]})])
+    kb = {"one_time": False, "inline": False, "buttons": buttons}
     for admin_id in ADMIN_IDS:
         send(admin_id, text, kb)
+
+
+def _plural(n: int, one: str, few: str, many: str) -> str:
+    """Русское склонение: 1 занятие, 2 занятия, 5 занятий."""
+    n = abs(int(n))
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return few
+    return many
+
+
+def build_report_text(days: int) -> str:
+    """Отчёт по посещаемости за период: сколько занятий провели по каждой
+    группе и кто сколько раз пришёл. Верх списка — самые активные,
+    низ — те, кто пропадает (им стоит написать)."""
+    groups = core.group_attendance_report(days)
+    students = core.student_attendance_report(days)
+    lines = [f"📊 Отчёт за последние {days} дн."]
+
+    lines.append("")
+    if groups:
+        lines.append("Занятия по группам:")
+        for g in groups:
+            lines.append(
+                f"{g['name']} — {g['lessons']} "
+                f"{_plural(g['lessons'], 'занятие', 'занятия', 'занятий')}, "
+                f"{g['visits']} "
+                f"{_plural(g['visits'], 'посещение', 'посещения', 'посещений')}"
+            )
+    else:
+        lines.append("Занятий за период не отмечено.")
+
+    if students:
+        lines.append("")
+        lines.append("Посещения учеников:")
+        for s in students:
+            mark = " ⚠️ не был(а)" if s["visits"] == 0 else ""
+            lines.append(f"{s['name']} — {s['visits']} (баланс {s['balance']}){mark}")
+
+    return "\n".join(lines)
+
+
+def start_group_assignment(user_id: int, peer_id: int, sid: int):
+    """Открыть мультивыбор групп для одного ученика — используется и из
+    пункта меню «Назначить группы», и сразу после создания/регистрации
+    ученика (кнопка-ярлык у админа)."""
+    s = core.get_student(sid)
+    if not s:
+        send(peer_id, "Ученик не найден.", ADMIN_MENU)
+        return
+    selected = {g["id"] for g in core.get_student_groups(sid)}
+    _multi[user_id] = selected
+    _state[user_id] = {"step": "assign_groups", "data": {"sid": sid}}
+    send(peer_id, f"Отметьте группы для «{s['name']}», затем нажмите «Готово»:",
+         student_groups_keyboard(sid, selected, 0))
 
 
 def notify_student_low_balance(student_id: int, balance: int):
@@ -453,16 +803,18 @@ def handle_message(msg: dict, client_info: dict | None = None):
     #     кнопки переключают режим ---
     if cmd and is_admin(user_id) and handle_admin_cmd(cmd, payload, peer_id, user_id):
         return
-    if cmd and not is_admin(user_id) and cmd in (ADMIN_MENU_CMDS | {
-        "pick", "pick_page", "pick_cancel", "att", "att_page", "att_done",
-        "att_cancel", "del_ok",
-    }):
+    if cmd and not is_admin(user_id) and cmd in (ADMIN_MENU_CMDS | ADMIN_ONLY_EXTRA_CMDS):
         send(peer_id, "Эта функция доступна только педагогу.")
         return
 
     # --- незавершённый диалог (ввод текста внутри многошагового процесса) ---
     if st:
         handle_dialog(user_id, peer_id, text, st)
+        # Шаги диалога меняют st на месте (st["step"] = ...), а такие мутации
+        # словарь сам в базу не пишет — сохраняем явно, иначе после
+        # перезапуска человек откатится на шаг назад.
+        if user_id in _state:
+            _state.save(user_id)
         return
 
     # --- ученик смотрит баланс или депозит ---
@@ -489,7 +841,8 @@ def handle_message(msg: dict, client_info: dict | None = None):
     # --- главное меню педагога по кнопке из reply-клавиатуры (текстом) ---
     if is_admin(user_id) and text in {
         BTN_NEW, BTN_LESSON, BTN_LIST, BTN_PAY, BTN_LINK, BTN_DELETE,
-        BTN_DEPOSIT, BTN_CARD, BTN_UPLOAD_SCHEDULE,
+        BTN_DEPOSIT, BTN_CARD, BTN_UPLOAD_SCHEDULE, BTN_GROUPS, BTN_ASSIGN_GROUPS,
+        BTN_REPORT,
     }:
         handle_admin_cmd(_label_to_cmd(text), {}, peer_id, user_id)
         return
@@ -536,6 +889,7 @@ def _label_to_cmd(label: str) -> str:
         BTN_NEW: "new", BTN_LESSON: "lesson", BTN_LIST: "list",
         BTN_PAY: "pay", BTN_LINK: "link", BTN_DELETE: "delete",
         BTN_DEPOSIT: "deposit", BTN_CARD: "card", BTN_UPLOAD_SCHEDULE: "upload_schedule",
+        BTN_GROUPS: "groups", BTN_ASSIGN_GROUPS: "assign_groups", BTN_REPORT: "report",
     }.get(label, "")
 
 
@@ -548,7 +902,7 @@ def handle_admin_cmd(cmd: str, payload: dict, peer_id: int, user_id: int) -> boo
     titles = {
         "pay": "Кому пополнить занятия?", "link": "Кому дать ссылку?",
         "delete": "Кого удалить?", "deposit": "У кого проверить депозит?",
-        "card": "О ком показать карточку?",
+        "card": "О ком показать карточку?", "assign_groups": "Кому назначить группы?",
     }
 
     if cmd == "new":
@@ -567,24 +921,211 @@ def handle_admin_cmd(cmd: str, payload: dict, peer_id: int, user_id: int) -> boo
         if not students:
             send(peer_id, f'Учеников пока нет. Добавьте через «{BTN_NEW}».', ADMIN_MENU)
             return True
-        lines = [
-            f"{s['name']} — {s['balance']}" + (" ⚠️" if s["balance"] <= 1 else "")
-            for s in students
-        ]
-        send(peer_id, "📋 Список учеников:\n\n" + "\n".join(lines), ADMIN_MENU)
+        groups = core.list_groups()
+        if not groups:
+            # групп ещё нет — старое плоское поведение
+            lines = [
+                f"{s['name']} — {s['balance']}" + (" ⚠️" if s["balance"] <= 1 else "")
+                for s in students
+            ]
+            send(peer_id, "📋 Список учеников:\n\n" + "\n".join(lines), ADMIN_MENU)
+            return True
+
+        def _line(s):
+            return f"{s['name']} — {s['balance']}" + (" ⚠️" if s["balance"] <= 1 else "")
+
+        blocks = []
+        for g in groups:
+            members = core.list_students_by_group(g["id"])
+            header = f"👥 {g['name']} ({len(members)}):"
+            block = header + "\n" + ("\n".join(_line(s) for s in members) if members else "(пусто)")
+            blocks.append(block)
+        no_group = core.list_students_without_group()
+        if no_group:
+            blocks.append(f"🚫 Без группы ({len(no_group)}):\n" + "\n".join(_line(s) for s in no_group))
+        header = f"📋 Список учеников — всего {len(students)}"
+        send(peer_id, header + "\n\n" + "\n\n".join(blocks), ADMIN_MENU)
         return True
 
     if cmd == "lesson":
         if not core.list_students():
             send(peer_id, f'Сначала добавьте учеников через «{BTN_NEW}».', ADMIN_MENU)
             return True
-        _attendance[user_id] = set()
-        _state[user_id] = {"step": "attendance", "data": {"page": 0}}
-        send(peer_id, "Отметьте, кто был на занятии, затем нажмите «Готово»:",
-             attendance_keyboard(set(), 0))
+        if not core.list_groups():
+            # групп ещё нет — сразу общий список, как раньше
+            _attendance[user_id] = set()
+            _state[user_id] = {"step": "attendance", "data": {"page": 0, "filter_type": "all"}}
+            send(peer_id, attendance_prompt(set(), "all"),
+                 attendance_keyboard(set(), 0))
+            return True
+        _state[user_id] = {"step": "lesson_pick_group", "data": {}}
+        send(peer_id, "По какой группе отмечаем занятие?", lesson_group_choice_keyboard())
         return True
 
-    if cmd in {"pay", "link", "delete", "deposit", "card"}:
+    if cmd in {"lesson_all", "lesson_group", "lesson_nogroup"}:
+        if cmd == "lesson_group":
+            gid = payload.get("id")
+            data = {"page": 0, "filter_type": "group", "group_id": gid}
+        elif cmd == "lesson_nogroup":
+            data = {"page": 0, "filter_type": "none"}
+        else:
+            data = {"page": 0, "filter_type": "all"}
+        _attendance[user_id] = set()
+        _state[user_id] = {"step": "attendance", "data": data}
+        send(peer_id, attendance_prompt(set(), data["filter_type"], data.get("group_id")),
+             attendance_keyboard(set(), 0, data["filter_type"], data.get("group_id")))
+        return True
+
+    if cmd == "groups":
+        groups = core.list_groups()
+        text = "👥 Группы:" if groups else "Групп пока нет. Создайте первую:"
+        send(peer_id, text, groups_menu_keyboard())
+        return True
+
+    if cmd == "grp_page":
+        send(peer_id, "👥 Группы:", groups_menu_keyboard(payload.get("page", 0)))
+        return True
+
+    if cmd == "lesson_group_page":
+        send(peer_id, "По какой группе отмечаем занятие?",
+             lesson_group_choice_keyboard(payload.get("page", 0)))
+        return True
+
+    if cmd == "report":
+        send(peer_id, "За какой период показать отчёт?", report_period_keyboard())
+        return True
+
+    if cmd == "report_run":
+        days = payload.get("days", 30)
+        send(peer_id, build_report_text(days), ADMIN_MENU)
+        return True
+
+    if cmd == "noop":
+        return True
+
+    if cmd == "grp_new":
+        _state[user_id] = {"step": "group_name", "data": {}}
+        send(peer_id, "Введите название группы:", CANCEL_MENU)
+        return True
+
+    if cmd == "grp_open":
+        gid = payload.get("id")
+        g = core.get_group(gid)
+        if not g:
+            send(peer_id, "Группа не найдена.", groups_menu_keyboard())
+            return True
+        members = core.list_students_by_group(gid)
+        lines = [f"{s['name']} — {s['balance']}" + (" ⚠️" if s["balance"] <= 1 else "")
+                 for s in members]
+        text = f"👥 {g['name']}\n\nСостав ({len(members)}):\n" + (
+            "\n".join(lines) if members else "(пока никого нет)"
+        )
+        send(peer_id, text, group_detail_keyboard(gid))
+        return True
+
+    if cmd == "grp_rename":
+        gid = payload.get("id")
+        _state[user_id] = {"step": "group_rename", "data": {"gid": gid}}
+        send(peer_id, "Введите новое название группы:", CANCEL_MENU)
+        return True
+
+    if cmd == "grp_delete":
+        gid = payload.get("id")
+        g = core.get_group(gid)
+        name = g["name"] if g else "группа"
+        send(peer_id, f"Удалить группу «{name}»?\nУченики останутся, история посещений сохранится.",
+             group_confirm_delete_keyboard(gid))
+        return True
+
+    if cmd == "grp_delete_ok":
+        gid = payload.get("id")
+        g = core.get_group(gid)
+        name = g["name"] if g else "группа"
+        core.deactivate_group(gid)
+        send(peer_id, f"Группа «{name}» удалена ✅", ADMIN_MENU)
+        return True
+
+    if cmd == "grp_students":
+        gid = payload.get("id")
+        _state[user_id] = {"step": "grp_students", "data": {"gid": gid, "page": 0}}
+        g = core.get_group(gid)
+        send(peer_id, f"Состав группы «{g['name'] if g else ''}» — нажимайте, чтобы добавить/убрать:",
+             group_students_keyboard(gid, 0))
+        return True
+
+    if cmd == "grp_stud_toggle":
+        gid = payload.get("gid")
+        sid = payload.get("id")
+        page = payload.get("page", 0)
+        current = {g["id"] for g in core.get_student_groups(sid)}
+        if gid in current:
+            current.discard(gid)
+        else:
+            current.add(gid)
+        core.set_student_groups(sid, list(current))
+        send(peer_id, "Отметьте состав группы:", group_students_keyboard(gid, page))
+        return True
+
+    if cmd == "grp_stud_page":
+        gid = payload.get("gid")
+        page = payload.get("page", 0)
+        _state[user_id] = {"step": "grp_students", "data": {"gid": gid, "page": page}}
+        send(peer_id, "Отметьте состав группы:", group_students_keyboard(gid, page))
+        return True
+
+    if cmd == "grp_stud_done":
+        gid = payload.get("id")
+        _state.pop(user_id, None)
+        g = core.get_group(gid)
+        send(peer_id, f"Состав группы «{g['name'] if g else ''}» сохранён ✅", ADMIN_MENU)
+        return True
+
+    if cmd == "sgrp_start":
+        sid = payload.get("id")
+        start_group_assignment(user_id, peer_id, sid)
+        return True
+
+    if cmd == "sgrp_toggle":
+        sid = payload.get("sid")
+        gid = payload.get("id")
+        page = payload.get("page", 0)
+        selected = _multi.setdefault(user_id, set())
+        if gid in selected:
+            selected.remove(gid)
+        else:
+            selected.add(gid)
+        _multi.save(user_id)
+        send(peer_id, "Отметьте группы ученика, затем нажмите «Готово»:",
+             student_groups_keyboard(sid, selected, page))
+        return True
+
+    if cmd == "sgrp_page":
+        sid = payload.get("sid")
+        page = payload.get("page", 0)
+        selected = _multi.setdefault(user_id, set())
+        send(peer_id, "Отметьте группы ученика, затем нажмите «Готово»:",
+             student_groups_keyboard(sid, selected, page))
+        return True
+
+    if cmd == "sgrp_done":
+        sid = payload.get("sid")
+        selected = _multi.pop(user_id, set())
+        core.set_student_groups(sid, list(selected))
+        _state.pop(user_id, None)
+        s = core.get_student(sid)
+        send(peer_id, f"✅ Группы для «{s['name'] if s else ''}» сохранены.", ADMIN_MENU)
+        return True
+
+    if cmd == "sgrp_cancel":
+        _multi.pop(user_id, None)
+        _state.pop(user_id, None)
+        send(peer_id, "Отменено.", ADMIN_MENU)
+        return True
+
+    if cmd == "att_noop":
+        return True
+
+    if cmd in {"pay", "link", "delete", "deposit", "card", "assign_groups"}:
         if not core.list_students():
             send(peer_id, "Учеников пока нет.", ADMIN_MENU)
             return True
@@ -636,6 +1177,8 @@ def handle_admin_cmd(cmd: str, payload: dict, peer_id: int, user_id: int) -> boo
         elif act == "card":
             _state.pop(user_id, None)
             send(peer_id, student_card_text(s), ADMIN_MENU)
+        elif act == "assign_groups":
+            start_group_assignment(user_id, peer_id, sid)
         return True
 
     if cmd == "del_ok":
@@ -654,16 +1197,33 @@ def handle_admin_cmd(cmd: str, payload: dict, peer_id: int, user_id: int) -> boo
             selected.remove(sid)
         else:
             selected.add(sid)
+        _attendance.save(user_id)
         page = payload.get("page", 0)
-        send(peer_id, "Отметьте, кто был на занятии, затем нажмите «Готово»:",
-             attendance_keyboard(selected, page))
+        filter_type = payload.get("filter_type", "all")
+        group_id = payload.get("group_id")
+        send(peer_id, attendance_prompt(selected, filter_type, group_id),
+             attendance_keyboard(selected, page, filter_type, group_id))
+        return True
+
+    if cmd in {"att_all", "att_none"}:
+        filter_type = payload.get("filter_type", "all")
+        group_id = payload.get("group_id")
+        if cmd == "att_all":
+            selected = {s["id"] for s in attendance_students(filter_type, group_id)}
+        else:
+            selected = set()
+        _attendance[user_id] = selected
+        send(peer_id, attendance_prompt(selected, filter_type, group_id),
+             attendance_keyboard(selected, 0, filter_type, group_id))
         return True
 
     if cmd == "att_page":
         selected = _attendance.setdefault(user_id, set())
         page = payload.get("page", 0)
-        send(peer_id, "Отметьте, кто был на занятии, затем нажмите «Готово»:",
-             attendance_keyboard(selected, page))
+        filter_type = payload.get("filter_type", "all")
+        group_id = payload.get("group_id")
+        send(peer_id, attendance_prompt(selected, filter_type, group_id),
+             attendance_keyboard(selected, page, filter_type, group_id))
         return True
 
     if cmd == "att_cancel":
@@ -674,15 +1234,22 @@ def handle_admin_cmd(cmd: str, payload: dict, peer_id: int, user_id: int) -> boo
 
     if cmd == "att_done":
         selected = _attendance.get(user_id) or set()
+        st = _state.get(user_id) or {}
+        group_id = (st.get("data") or {}).get("group_id")
         _state.pop(user_id, None)
         if not selected:
             send(peer_id, "Никто не отмечен.", ADMIN_MENU)
             return True
-        result = core.mark_lesson(list(selected))
+        result = core.mark_lesson(list(selected), group_id)
         _attendance.pop(user_id, None)
         lines = [f"{r['name']} → осталось {r['balance']}" for r in result]
         ran_out = [r["name"] for r in result if r["out"]]
-        text = "✅ Занятие отмечено:\n\n" + "\n".join(lines)
+        filter_type = (st.get("data") or {}).get("filter_type", "all")
+        title = attendance_title(filter_type, group_id)
+        text = (f"✅ Занятие отмечено — {title}\n"
+                f"Всего: {len(result)} "
+                f"{_plural(len(result), 'человек', 'человека', 'человек')}\n\n"
+                + "\n".join(lines))
         if ran_out:
             text += "\n\n⚠️ Занятия закончились, нужна оплата:\n" + "\n".join(ran_out)
         send(peer_id, text, ADMIN_MENU)
@@ -721,6 +1288,11 @@ def handle_dialog(user_id: int, peer_id: int, text: str, st: dict):
              f"🔗 Ссылка для ученика:\n{student_link(s['claim_code'])}\n\n"
              f"Если ссылка не сработает, ученик может прислать боту этот код: {s['claim_code']}",
              ADMIN_MENU)
+        if core.list_groups():
+            send(peer_id, "Сразу назначить группы?", {
+                "one_time": False, "inline": False,
+                "buttons": [[_btn(BTN_ASSIGN_GROUPS, "sgrp_start", {"id": sid}, color="primary")]],
+            })
         return
 
     if step == "topup":
@@ -743,6 +1315,34 @@ def handle_dialog(user_id: int, peer_id: int, text: str, st: dict):
         _state.pop(user_id, None)
         s = core.get_student(sid)
         send(peer_id, f"✅ {s['name']}: депозит теперь {new_dep} ₽.", ADMIN_MENU)
+        return
+
+    # --- управление группами (создание / переименование) ---
+    if step == "group_name":
+        if not text:
+            send(peer_id, "Пожалуйста, введите название группы текстом.")
+            return
+        try:
+            core.add_group(text)
+        except ValueError:
+            send(peer_id, "Название не может быть пустым. Введите ещё раз:")
+            return
+        _state.pop(user_id, None)
+        send(peer_id, f"✅ Группа «{text.strip()}» создана.", ADMIN_MENU)
+        return
+
+    if step == "group_rename":
+        if not text:
+            send(peer_id, "Пожалуйста, введите новое название текстом.")
+            return
+        gid = st["data"]["gid"]
+        try:
+            core.rename_group(gid, text)
+        except ValueError:
+            send(peer_id, "Название не может быть пустым. Введите ещё раз:")
+            return
+        _state.pop(user_id, None)
+        send(peer_id, f"✅ Группа переименована в «{text.strip()}».", ADMIN_MENU)
         return
 
     # --- анкета нового ученика (ребёнок или взрослый) ---
@@ -862,6 +1462,13 @@ def get_longpoll_server():
 
 def run():
     core.init_db()
+    # Поднимаем незавершённые диалоги и чистим зависшие: человек мог начать
+    # анкету и пропасть — держать его состояние вечно смысла нет.
+    purged = core.purge_old_sessions(24)
+    for store in (_state, _attendance, _multi):
+        store.load()
+    if purged or _state:
+        log.info("Сессии: восстановлено %s, удалено просроченных %s", len(_state), purged)
     server, key, ts = get_longpoll_server()
     log.info("VK-бот запущен, сообщество %s", GROUP_ID)
 

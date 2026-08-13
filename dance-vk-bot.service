@@ -1,0 +1,41 @@
+[Unit]
+# Автозапуск VK-бота: сейчас, если процесс упадёт, всё встанет молча —
+# педагог узнает об этом от учеников. С этим юнитом бот поднимется сам.
+#
+# Установка (на сервере, под root):
+#   1) положить проект в /opt/dance-bot
+#   2) скопировать файл:  cp dance-vk-bot.service /etc/systemd/system/
+#   3) прописать свои токены ниже (или вынести в /opt/dance-bot/.env)
+#   4) systemctl daemon-reload
+#      systemctl enable --now dance-vk-bot
+#   Логи:   journalctl -u dance-vk-bot -f
+#   Статус: systemctl status dance-vk-bot
+#
+# Для Telegram-бота сделать копию файла с именем dance-tg-bot.service,
+# заменив vk_bot.py на bot.py и токены на телеграмные.
+
+Description=Dance studio VK bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dancebot
+WorkingDirectory=/opt/dance-bot
+
+Environment="VK_TOKEN=сюда_ключ_доступа_сообщества"
+Environment="VK_GROUP_ID=123456789"
+Environment="VK_ADMIN_ID=420380178,111222333"
+
+ExecStart=/usr/bin/python3 /opt/dance-bot/vk_bot.py
+
+# Падение из-за сети или сбоя VK API не должно останавливать бота насовсем
+Restart=always
+RestartSec=5
+
+# Логи идут в journald
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
